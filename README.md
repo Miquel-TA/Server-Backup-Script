@@ -1,1 +1,1 @@
-# Server-Backup-Script
+## This script automates the backup of my server resources to Google Drive. Unix Pipes are used to gather, compress and upload the files with minimal disk and ram footprint. It includes logging, managing retention of backups, and error handling.
