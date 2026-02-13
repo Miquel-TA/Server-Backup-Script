@@ -117,7 +117,7 @@ def backup_files_stream():
 
     # Build Tar Command
     # -c: create, -z: gzip, -f -: output to stdout, -P: start from root dir
-    tar_cmd = ["tar", "-czf", "-", "-C"]
+    tar_cmd = ["tar", "-czf", "-", "-C", "/"]
 
     valid_targets_count = 0
     for name, path in BACKUP_TARGETS.items():
