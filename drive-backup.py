@@ -116,13 +116,13 @@ def backup_files_stream():
     log(f"Starting File Stream to: {remote_dest}")
 
     # Build Tar Command
-    # -c: create, -z: gzip, -f -: output to stdout, -P: absolute paths
-    tar_cmd = ["tar", "-czf", "-", "-P"]
+    # -c: create, -z: gzip, -f -: output to stdout, -P: start from root dir
+    tar_cmd = ["tar", "-czf", "-", "-C"]
 
     valid_targets_count = 0
     for name, path in BACKUP_TARGETS.items():
         if os.path.exists(path):
-            tar_cmd.append(path)
+            tar_cmd.append(path.lstrip("/"))
             valid_targets_count += 1
             #log(f"  [+] Added: {path}")
         else:
