@@ -1,147 +1,219 @@
-#!/usr/bin/env python3
 import os
 import sys
 import subprocess
 import datetime
 import json
 import logging
-from logging.handlers import RotatingFileHandler
 import concurrent.futures
+import io
+import smtplib
+import base64
+import urllib.request
+import urllib.parse
+from email.message import EmailMessage
 
-# --- Configuration ---
-RCLONE_REMOTE = "gdrive"
-BASE_REMOTE_PATH = "backups/automated_server_backups"
+# Sensitive config setup
+SENSITIVE_CONFIG_FILE = "/root/.config/drive-backup/variables.conf"
+def load_config(filepath):
+    """Loads configuration variables from a KEY=VALUE file."""
+    config = {}
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                key, value = line.split('=', 1)
+                config[key.strip()] = value.strip()
+    return config
+config = load_config(SENSITIVE_CONFIG_FILE)
+
+# Backup settings
+BASE_FOLDER_ID = config["DRIVE_BASE_FOLDER_ID"]
 MAX_BACKUPS = 14
 
+# Starting timestamp for backups and emails
 TIMESTAMP = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-LOG_FILE_PATH = "/root/drive-backup-logs.txt"
-CURRENT_BACKUP_REMOTE_DIR = f"{BASE_REMOTE_PATH}/backup_{TIMESTAMP}"
+CURRENT_BACKUP_NAME = f"backup_{TIMESTAMP}"
 
-DB_USER = "prestashop"
-DB_PASS = "REPLACE_ME"
-DB_NAME = "prestashop"
+# Sensitive configs
+DB_USER = config["DB_USER"]
+DB_PASS = config["DB_PASS"]
+DB_NAME = config["DB_NAME"]
 
+EMAIL_TO = config["EMAIL_TO"]
+EMAIL_FROM = config["EMAIL_FROM"]
+
+OAUTH_CLIENT_ID = config["OAUTH_CLIENT_ID"]
+OAUTH_CLIENT_SECRET = config["OAUTH_CLIENT_SECRET"]
+OAUTH_REFRESH_TOKEN_GMAIL = config["OAUTH_REFRESH_TOKEN_GMAIL"]
+OAUTH_REFRESH_TOKEN_DRIVE = config["OAUTH_REFRESH_TOKEN_DRIVE"]
+
+# Sources to backup
 BACKUP_TARGETS = {
     "apache2_config": "/etc/apache2",
     "letsencrypt_config": "/etc/letsencrypt",
     "wireguard_data": "/var/lib/docker/volumes/wg-easy_etc_wireguard/_data/",
     "wireguard_compose": "/root/wg-easy",
     "website_html": "/var/www/html",
-    "terraria_server": "/home/amp/.ampdata/instances/Terraria_Vanilla_02_202601/Terraria",
-    "minecraft_server": "/home/amp/.ampdata/instances/Cobblemon_1_21_101/Minecraft",
+    "terraria_infernum_server": "/home/amp/.ampdata/instances/Infernum01/tModLoader/serverfiles/",
+#   "terraria_vanilla_server": "/home/amp/.ampdata/instances/Terraria_Vanilla_02_202601/Terraria",
+    "cobblemon_server": "/home/amp/.ampdata/instances/Cobblemon_1_21_101/Minecraft",
+    "semivanilla_server_paula": "/home/amp/.ampdata/instances/Modded_PolPaula_121101/Minecraft",
+    "semivanilla_server_iyo": "/home/amp/.ampdata/instances/Modded_Iyo_121101/Minecraft",
     "ufw_etc": "/etc/ufw",
     "ufw_defaults": "/etc/default/ufw",
     "drive_backup_script": "/root/drive-backup.py",
     "php_config": "/etc/php/"
 }
 
-def setup_logger():
-    """Configures a rotating logger ensuring strict 0o700 file permissions."""
-    if not os.path.exists(LOG_FILE_PATH):
-        # Create file with restrictive permissions immediately
-        fd = os.open(LOG_FILE_PATH, os.O_CREAT | os.O_WRONLY, 0o700)
-        os.close(fd)
-    else:
-        # Enforce permissions if file already exists
-        os.chmod(LOG_FILE_PATH, 0o700)
+# Global state variables. Will be set during the execution.
+DRIVE_ACCESS_TOKEN = None
+GMAIL_ACCESS_TOKEN = None
+TARGET_FOLDER_ID = None
 
+# Logging system
+log_stream = io.StringIO()
+def setup_logger():
     logger = logging.getLogger("BackupLogger")
     logger.setLevel(logging.INFO)
-    
-    if not logger.handlers:
-        # 10MB rotation, keep 1 backup file (.1)
-        handler = RotatingFileHandler(LOG_FILE_PATH, maxBytes=10*1024*1024, backupCount=1)
-        formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-        handler.setFormatter(formatter)
-        
-        console = logging.StreamHandler()
-        console.setFormatter(formatter)
-        
-        logger.addHandler(handler)
-        logger.addHandler(console)
-        
-    return logger
 
+    if not logger.handlers:
+        formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        memory_handler = logging.StreamHandler(log_stream)
+        memory_handler.setFormatter(formatter)
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(memory_handler)
+        logger.addHandler(console_handler)
+    return logger
 log = setup_logger()
 
-def run_rclone_cmd(args, check=True):
-    cmd = ["rclone"] + args
-    result = subprocess.run(cmd, capture_output=True, text=True)
+# Get token for Gmail or Drive
+def get_access_token(refresh_token):
+    url = "https://oauth2.googleapis.com/token"
+    params = {
+        "client_id": OAUTH_CLIENT_ID,
+        "client_secret": OAUTH_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token"
+    }
+    data = urllib.parse.urlencode(params).encode("utf-8")
+    req = urllib.request.Request(url, data=data)
 
-    if result.returncode != 0:
-        log.error(f"Rclone command failed: {' '.join(cmd)}")
-        log.error(f"Rclone Stderr: {result.stderr}")
-        if check:
-            raise Exception(f"Rclone failed: {result.stderr}")
-    return result.stdout
+    with urllib.request.urlopen(req) as response:
+        result = json.loads(response.read().decode("utf-8"))
+        return result["access_token"]
 
+# Send email via smtp using oauth2
+def send_email_report(status):
+    log.info("Preparing email report...")
+
+    msg = EmailMessage()
+    msg['Subject'] = f"Backup Report [{status}] started at [{TIMESTAMP}]"
+    msg['From'] = EMAIL_FROM
+    msg['To'] = EMAIL_TO
+
+    log_contents = log_stream.getvalue()
+    msg.set_content(f"Backup Status: {status}\n\nBackup Logs:\n{'-'*40}\n{log_contents}")
+
+    try:
+        auth_string = f"user={EMAIL_FROM}\1auth=Bearer {GMAIL_ACCESS_TOKEN}\1\1"
+        auth_encoded = base64.b64encode(auth_string.encode('ascii')).decode('ascii')
+
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.ehlo()
+        server.starttls()
+
+        code, resp = server.docmd("AUTH", f"XOAUTH2 {auth_encoded}")
+        if code != 235:
+            error_details = base64.b64decode(resp).decode('utf-8') if resp else "No details"
+            raise Exception(f"SMTP Auth Rejected (Code {code}): {error_details}")
+
+        server.send_message(msg)
+        server.quit()
+        print("Email report sent successfully.")
+    except Exception as e:
+        print(f"Error sending email: {e}")
+
+# Creates a folder in Google Drive and returns its ID
+def create_drive_folder(name, parent_id):
+    metadata = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id]
+    }
+    req = urllib.request.Request(
+        "https://www.googleapis.com/drive/v3/files",
+        data=json.dumps(metadata).encode('utf-8'),
+        headers={
+            "Authorization": f"Bearer {DRIVE_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read().decode('utf-8'))['id']
+
+# Gets a resumable upload URL from Google Drive API
+def get_resumable_upload_url(filename):
+    metadata = {"name": filename, "parents": [TARGET_FOLDER_ID]}
+    req = urllib.request.Request(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
+        data=json.dumps(metadata).encode('utf-8'),
+        headers={
+            "Authorization": f"Bearer {DRIVE_ACCESS_TOKEN}",
+            "Content-Type": "application/json; charset=UTF-8"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req) as resp:
+        return resp.getheader('Location')
+
+# Dumps DB, gzips it and uploads it to gdrive using pipes
 def backup_database_stream():
-    """Streams DB -> Gzip -> Rclone (No local disk usage)."""
     filename = "database.sql.gz"
-    remote_dest = f"{RCLONE_REMOTE}:{CURRENT_BACKUP_REMOTE_DIR}/{filename}"
-    log.info(f"Starting Database Stream to: {remote_dest}")
+    log.info(f" +Streaming DB {DB_NAME} to {filename}")
 
     env = os.environ.copy()
     env['MYSQL_PWD'] = DB_PASS
 
-    # --- PIPELINE CONSTRUCTION ---
-    # Data flows from p1_dump -> p2_gzip -> p3_rclone in memory.
-    
-    # 1. Start Mysqldump (Producer)
+    upload_url = get_resumable_upload_url(filename)
+
     p1_dump = subprocess.Popen(
         ["mysqldump", "-u", DB_USER, DB_NAME, "--single-transaction", "--quick"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
     )
-
-    # 2. Start Gzip (Filter) - reads from p1's stdout
     p2_gzip = subprocess.Popen(
         ["gzip", "-c"],
-        stdin=p1_dump.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
+        stdin=p1_dump.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    p3_curl = subprocess.Popen(
+        ["curl", "-s", "--fail", "-X", "PUT", "-T", "-", upload_url],
+        stdin=p2_gzip.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
 
-    # 3. Start Rclone (Consumer) - reads from p2's stdout
-    p3_rclone = subprocess.Popen(
-        ["rclone", "rcat", remote_dest, "--stats", "5s"],
-        stdin=p2_gzip.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-
-    # CRITICAL: Close parent copies of the file descriptors.
-    # If we don't do this, the child processes (gzip/rclone) will never receive 
-    # an EOF (End Of File) signal because the parent process still holds the pipe open, 
-    # causing the pipeline to hang indefinitely.
     p1_dump.stdout.close()
     p2_gzip.stdout.close()
 
-    # Wait for the end of the pipeline and capture stderr
-    rclone_out, rclone_err = p3_rclone.communicate()
+    curl_out, curl_err = p3_curl.communicate()
     gzip_out, gzip_err = p2_gzip.communicate()
     dump_out, dump_err = p1_dump.communicate()
 
-    if p3_rclone.returncode != 0:
-        raise Exception(f"Rclone DB Upload Failed: {rclone_err.decode()}")
-
+    if p3_curl.returncode != 0:
+        raise Exception(f"Drive DB Upload Failed: {curl_err.decode()}")
     if p1_dump.returncode != 0:
         raise Exception(f"Mysqldump Failed: {dump_err.decode()}")
 
     log.info("Database stream completed successfully.")
 
+# Compresses the files and directories and uploads them to gdrive
 def backup_files_stream():
-    """Streams Tar -> Rclone (No local disk usage) with full error handling."""
     filename = "files.tar.gz"
-    remote_dest = f"{RCLONE_REMOTE}:{CURRENT_BACKUP_REMOTE_DIR}/{filename}"
-    log.info(f"Starting File Stream to: {remote_dest}")
-
     tar_cmd = ["tar", "-czf", "-", "-C", "/"]
 
     valid_targets_count = 0
     for name, path in BACKUP_TARGETS.items():
         if os.path.exists(path):
+            log.info(f" +Streaming {name} to {filename}")
             tar_cmd.append(path.lstrip("/"))
             valid_targets_count += 1
         else:
@@ -151,29 +223,24 @@ def backup_files_stream():
         log.error("No valid targets found to backup! Aborting file stream.")
         return
 
-    # 1. Start Tar (Producer)
+    upload_url = get_resumable_upload_url(filename)
+
     p1_tar = subprocess.Popen(
         tar_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    p2_curl = subprocess.Popen(
+        ["curl", "-s", "--fail", "-X", "PUT", "-T", "-", upload_url],
+        stdin=p1_tar.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
 
-    # 2. Start Rclone (Consumer)
-    p2_rclone = subprocess.Popen(
-        ["rclone", "rcat", remote_dest, "--stats", "10s"],
-        stdin=p1_tar.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-
-    # Close parent handle to allow pipe to trigger EOF on completion
     p1_tar.stdout.close()
 
-    rclone_out, rclone_err = p2_rclone.communicate()
+    curl_out, curl_err = p2_curl.communicate()
     tar_out, tar_err = p1_tar.communicate()
 
-    if p2_rclone.returncode != 0:
-        log.error(f"Rclone File Upload Failed: {rclone_err.decode()}")
+    if p2_curl.returncode != 0:
+        log.error(f"Drive File Upload Failed: {curl_err.decode()}")
         raise Exception("File stream upload failed")
 
     if p1_tar.returncode > 1:
@@ -184,54 +251,62 @@ def backup_files_stream():
 
     log.info("File stream completed successfully.")
 
+# Deletes old backups
 def manage_retention():
-    """Groups backups by folder and deletes old ones."""
     log.info("Checking retention policy...")
 
-    ls_out = run_rclone_cmd(["lsjson", f"{RCLONE_REMOTE}:{BASE_REMOTE_PATH}", "--dirs-only"])
-    dirs = json.loads(ls_out)
+    query = f"'{BASE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and name contains 'backup_' and trashed=false"
+    url = f"https://www.googleapis.com/drive/v3/files?q={urllib.parse.quote(query)}&fields=files(id,name)&orderBy=name"
 
-    backup_dirs = [d for d in dirs if d['Name'].startswith('backup_')]
-    backup_dirs.sort(key=lambda x: x['Name'])
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {DRIVE_ACCESS_TOKEN}"})
+    with urllib.request.urlopen(req) as resp:
+        dirs = json.loads(resp.read().decode('utf-8')).get('files', [])
 
-    log.info(f"Found {len(backup_dirs)} backup folders.")
+    log.info(f"Found {len(dirs)} backup folders.")
 
-    if len(backup_dirs) > MAX_BACKUPS:
-        to_delete = backup_dirs[:len(backup_dirs) - MAX_BACKUPS]
+    if len(dirs) > MAX_BACKUPS:
+        to_delete = dirs[:len(dirs) - MAX_BACKUPS]
         log.info(f"Retention exceeded. Deleting {len(to_delete)} old folders.")
 
         for item in to_delete:
-            folder_name = item['Name']
-            log.info(f"Purging old backup folder: {folder_name}")
-            run_rclone_cmd(["purge", f"{RCLONE_REMOTE}:{BASE_REMOTE_PATH}/{folder_name}"])
+            log.info(f"Purging old backup folder: {item['name']}")
+            del_req = urllib.request.Request(
+                f"https://www.googleapis.com/drive/v3/files/{item['id']}",
+                headers={"Authorization": f"Bearer {DRIVE_ACCESS_TOKEN}"},
+                method="DELETE"
+            )
+            urllib.request.urlopen(del_req)
     else:
         log.info("Retention limit not reached.")
 
+# Starting method
 def perform_backup():
-    log.info(f"Backup job started. ID: {TIMESTAMP}")
+    global DRIVE_ACCESS_TOKEN, GMAIL_ACCESS_TOKEN, TARGET_FOLDER_ID
+    log.info(f"Backup job started.")
+    status = "FAILED"
 
     try:
-        # 1. Create Remote Directory
-        run_rclone_cmd(["mkdir", f"{RCLONE_REMOTE}:{CURRENT_BACKUP_REMOTE_DIR}"], check=False)
+        DRIVE_ACCESS_TOKEN = get_access_token(OAUTH_REFRESH_TOKEN_DRIVE)
+        GMAIL_ACCESS_TOKEN = get_access_token(OAUTH_REFRESH_TOKEN_GMAIL)
+        TARGET_FOLDER_ID = create_drive_folder(CURRENT_BACKUP_NAME, BASE_FOLDER_ID)
 
-        # 2. Run Streams in Parallel
-        # ThreadPoolExecutor is ideal here since subprocesses release the GIL and are I/O bound
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_db = executor.submit(backup_database_stream)
             future_files = executor.submit(backup_files_stream)
 
-            # Wait for both threads and raise any exceptions caught during execution
             for future in concurrent.futures.as_completed([future_db, future_files]):
                 future.result()
 
-        # 3. Retention
         manage_retention()
+        status = "SUCCESS"
 
+    except KeyboardInterrupt:
+        log.error("Backup failed: Interrupted by user.")
     except Exception as e:
         log.error(f"Backup failed: {e}")
-
     finally:
         log.info("Backup finished.")
+        send_email_report(status)
 
 if __name__ == "__main__":
     if os.geteuid() != 0:
