@@ -56,7 +56,7 @@ BACKUP_TARGETS = {
     "wireguard_compose": "/root/wg-easy",
     "website_html": "/var/www/html",
     "terraria_infernum_server": "/home/amp/.ampdata/instances/Infernum01/tModLoader/serverfiles/",
-#    "terraria_vanilla_server": "/home/amp/.ampdata/instances/Terraria_Vanilla_02_202601/Terraria",
+#   "terraria_vanilla_server": "/home/amp/.ampdata/instances/Terraria_Vanilla_02_202601/Terraria",
     "cobblemon_server": "/home/amp/.ampdata/instances/Cobblemon_1_21_101/Minecraft",
     "semivanilla_server_paula": "/home/amp/.ampdata/instances/Modded_PolPaula_121101/Minecraft",
     "semivanilla_server_iyo": "/home/amp/.ampdata/instances/Modded_Iyo_121101/Minecraft",
@@ -291,6 +291,21 @@ def manage_retention():
     else:
         log.info("Retention limit not reached.")
 
+# Deletes the newly created backup folder if an error occurs
+def delete_incomplete_backup():
+    if TARGET_FOLDER_ID and DRIVE_ACCESS_TOKEN:
+        log.info("Cleaning up incomplete backup folder from Drive...")
+        try:
+            del_req = urllib.request.Request(
+                f"https://www.googleapis.com/drive/v3/files/{TARGET_FOLDER_ID}",
+                headers={"Authorization": f"Bearer {DRIVE_ACCESS_TOKEN}"},
+                method="DELETE"
+            )
+            urllib.request.urlopen(del_req, timeout=30)
+            log.info("Incomplete backup folder deleted successfully.")
+        except Exception as e:
+            log.error(f"Failed to delete incomplete backup folder: {e}")
+
 # Starting method
 def perform_backup():
     global DRIVE_ACCESS_TOKEN, GMAIL_ACCESS_TOKEN, TARGET_FOLDER_ID
@@ -314,8 +329,10 @@ def perform_backup():
 
     except KeyboardInterrupt:
         log.error("Backup failed: Interrupted by user.")
+        delete_incomplete_backup()
     except Exception as e:
         log.error(f"Backup failed: {e}")
+        delete_incomplete_backup()
     finally:
         log.info("Backup finished.")
         send_email_report(status)
