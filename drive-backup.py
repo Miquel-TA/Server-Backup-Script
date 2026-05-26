@@ -10,6 +10,7 @@ import smtplib
 import base64
 import urllib.request
 import urllib.parse
+import threading
 from email.message import EmailMessage
 
 # Sensitive config setup
@@ -65,7 +66,7 @@ BACKUP_TARGETS = {
     "php_config": "/etc/php/"
 }
 
-# Global state variables. Will be set during the execution.
+# Global state variables
 DRIVE_ACCESS_TOKEN = None
 GMAIL_ACCESS_TOKEN = None
 TARGET_FOLDER_ID = None
@@ -99,7 +100,7 @@ def get_access_token(refresh_token):
     data = urllib.parse.urlencode(params).encode("utf-8")
     req = urllib.request.Request(url, data=data)
 
-    with urllib.request.urlopen(req) as response:
+    with urllib.request.urlopen(req, timeout=30) as response:
         result = json.loads(response.read().decode("utf-8"))
         return result["access_token"]
 
@@ -116,7 +117,7 @@ def send_email_report(status):
     msg.set_content(f"Backup Status: {status}\n\nBackup Logs:\n{'-'*40}\n{log_contents}")
 
     try:
-        auth_string = f"user={EMAIL_FROM}\1auth=Bearer {GMAIL_ACCESS_TOKEN}\1\1"
+        auth_string = f"user={EMAIL_FROM}\x01auth=Bearer {GMAIL_ACCESS_TOKEN}\x01\x01"
         auth_encoded = base64.b64encode(auth_string.encode('ascii')).decode('ascii')
 
         server = smtplib.SMTP("smtp.gmail.com", 587)
@@ -150,7 +151,7 @@ def create_drive_folder(name, parent_id):
         },
         method="POST"
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode('utf-8'))['id']
 
 # Gets a resumable upload URL from Google Drive API
@@ -165,47 +166,54 @@ def get_resumable_upload_url(filename):
         },
         method="POST"
     )
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         return resp.getheader('Location')
 
-# Dumps DB, gzips it and uploads it to gdrive using pipes
+# Dumps DB, gzips it and uploads it to gdrive using purely in-memory managed pipes
 def backup_database_stream():
     filename = "database.sql.gz"
     log.info(f" +Streaming DB {DB_NAME} to {filename}")
 
     env = os.environ.copy()
     env['MYSQL_PWD'] = DB_PASS
-
     upload_url = get_resumable_upload_url(filename)
 
-    p1_dump = subprocess.Popen(
+    with subprocess.Popen(
         ["mysqldump", "-u", DB_USER, DB_NAME, "--single-transaction", "--quick"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
-    )
-    p2_gzip = subprocess.Popen(
-        ["gzip", "-c"],
-        stdin=p1_dump.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    p3_curl = subprocess.Popen(
-        ["curl", "-s", "--fail", "-X", "PUT", "-T", "-", upload_url],
-        stdin=p2_gzip.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
+    ) as p1_dump:
+        
+        dump_err_mem = []
+        threading.Thread(target=lambda: dump_err_mem.append(p1_dump.stderr.read()), daemon=True).start()
 
-    p1_dump.stdout.close()
-    p2_gzip.stdout.close()
+        with subprocess.Popen(
+            ["gzip", "-c"],
+            stdin=p1_dump.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        ) as p2_gzip:
+            
+            with subprocess.Popen(
+                ["curl", "-s", "--fail", "-X", "PUT", "-T", "-", upload_url],
+                stdin=p2_gzip.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            ) as p3_curl:
 
-    curl_out, curl_err = p3_curl.communicate()
-    gzip_out, gzip_err = p2_gzip.communicate()
-    dump_out, dump_err = p1_dump.communicate()
+                # Allow earlier processes to receive SIGPIPE if curl drops connection
+                p1_dump.stdout.close()
+                p2_gzip.stdout.close()
 
-    if p3_curl.returncode != 0:
-        raise Exception(f"Drive DB Upload Failed: {curl_err.decode()}")
-    if p1_dump.returncode != 0:
-        raise Exception(f"Mysqldump Failed: {dump_err.decode()}")
+                curl_out, curl_err = p3_curl.communicate()
+                p2_gzip.wait()
+                p1_dump.wait()
+
+                if p3_curl.returncode != 0:
+                    raise Exception(f"Drive DB cURL Upload Failed: {curl_err.decode('utf-8', errors='replace').strip()}")
+                
+                if p1_dump.returncode != 0:
+                    err_details = (dump_err_mem[0] if dump_err_mem else b'').decode('utf-8', errors='replace').strip()
+                    raise Exception(f"Mysqldump Failed: {err_details or f'Exit code {p1_dump.returncode}'}")
 
     log.info("Database stream completed successfully.")
 
-# Compresses the files and directories and uploads them to gdrive
+# Compresses the files and directories and uploads them to gdrive using purely in-memory managed pipes
 def backup_files_stream():
     filename = "files.tar.gz"
     tar_cmd = ["tar", "-czf", "-", "-C", "/"]
@@ -225,31 +233,33 @@ def backup_files_stream():
 
     upload_url = get_resumable_upload_url(filename)
 
-    p1_tar = subprocess.Popen(
+    with subprocess.Popen(
         tar_cmd,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    p2_curl = subprocess.Popen(
-        ["curl", "-s", "--fail", "-X", "PUT", "-T", "-", upload_url],
-        stdin=p1_tar.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
+    ) as p1_tar:
+        
+        tar_err_mem = []
+        threading.Thread(target=lambda: tar_err_mem.append(p1_tar.stderr.read()), daemon=True).start()
 
-    p1_tar.stdout.close()
+        with subprocess.Popen(
+            ["curl", "-s", "--fail", "-X", "PUT", "-T", "-", upload_url],
+            stdin=p1_tar.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ) as p2_curl:
 
-    curl_out, curl_err = p2_curl.communicate()
-    tar_out, tar_err = p1_tar.communicate()
+            p1_tar.stdout.close()
 
-    if p2_curl.returncode != 0:
-        err_details = curl_err.decode('utf-8', errors='replace').strip() or "Unknown cURL error"
-        log.error(f"Drive File Upload Failed: {err_details}")
-        raise Exception(f"File stream upload failed: {err_details}")
+            curl_out, curl_err = p2_curl.communicate()
+            p1_tar.wait()
 
-    if p1_tar.returncode > 1:
-        err_details = tar_err.decode('utf-8', errors='replace').strip() or "Unknown tar error"
-        log.error(f"Tar Fatal Error: {err_details}")
-        raise Exception(f"Tar compression failed: {err_details}")
-    elif p1_tar.returncode == 1:
-        log.warning("Tar warning (files changed during read), continuing...")
+            if p2_curl.returncode != 0:
+                err_details = curl_err.decode('utf-8', errors='replace').strip() or "Unknown cURL error"
+                raise Exception(f"File stream upload failed: {err_details}")
+
+            if p1_tar.returncode > 1:
+                err_details = (tar_err_mem[0] if tar_err_mem else b'').decode('utf-8', errors='replace').strip()
+                raise Exception(f"Tar compression failed: {err_details or f'Exit code {p1_tar.returncode}'}")
+            elif p1_tar.returncode == 1:
+                log.warning("Tar warning (files changed during read), continuing...")
 
     log.info("File stream completed successfully.")
 
@@ -261,7 +271,7 @@ def manage_retention():
     url = f"https://www.googleapis.com/drive/v3/files?q={urllib.parse.quote(query)}&fields=files(id,name)&orderBy=name"
 
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {DRIVE_ACCESS_TOKEN}"})
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=30) as resp:
         dirs = json.loads(resp.read().decode('utf-8')).get('files', [])
 
     log.info(f"Found {len(dirs)} backup folders.")
@@ -277,7 +287,7 @@ def manage_retention():
                 headers={"Authorization": f"Bearer {DRIVE_ACCESS_TOKEN}"},
                 method="DELETE"
             )
-            urllib.request.urlopen(del_req)
+            urllib.request.urlopen(del_req, timeout=30)
     else:
         log.info("Retention limit not reached.")
 
