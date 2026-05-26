@@ -55,7 +55,7 @@ BACKUP_TARGETS = {
     "wireguard_compose": "/root/wg-easy",
     "website_html": "/var/www/html",
     "terraria_infernum_server": "/home/amp/.ampdata/instances/Infernum01/tModLoader/serverfiles/",
-#   "terraria_vanilla_server": "/home/amp/.ampdata/instances/Terraria_Vanilla_02_202601/Terraria",
+#    "terraria_vanilla_server": "/home/amp/.ampdata/instances/Terraria_Vanilla_02_202601/Terraria",
     "cobblemon_server": "/home/amp/.ampdata/instances/Cobblemon_1_21_101/Minecraft",
     "semivanilla_server_paula": "/home/amp/.ampdata/instances/Modded_PolPaula_121101/Minecraft",
     "semivanilla_server_iyo": "/home/amp/.ampdata/instances/Modded_Iyo_121101/Minecraft",
@@ -240,12 +240,14 @@ def backup_files_stream():
     tar_out, tar_err = p1_tar.communicate()
 
     if p2_curl.returncode != 0:
-        log.error(f"Drive File Upload Failed: {curl_err.decode()}")
-        raise Exception("File stream upload failed")
+        err_details = curl_err.decode('utf-8', errors='replace').strip() or "Unknown cURL error"
+        log.error(f"Drive File Upload Failed: {err_details}")
+        raise Exception(f"File stream upload failed: {err_details}")
 
     if p1_tar.returncode > 1:
-        log.error(f"Tar Fatal Error: {tar_err.decode()}")
-        raise Exception("Tar compression failed")
+        err_details = tar_err.decode('utf-8', errors='replace').strip() or "Unknown tar error"
+        log.error(f"Tar Fatal Error: {err_details}")
+        raise Exception(f"Tar compression failed: {err_details}")
     elif p1_tar.returncode == 1:
         log.warning("Tar warning (files changed during read), continuing...")
 
